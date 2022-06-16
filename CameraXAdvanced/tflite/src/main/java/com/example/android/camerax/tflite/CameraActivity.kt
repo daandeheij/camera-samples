@@ -42,12 +42,12 @@ import org.tensorflow.lite.DataType
 import org.tensorflow.lite.Interpreter
 import org.tensorflow.lite.nnapi.NnApiDelegate
 import org.tensorflow.lite.support.common.FileUtil
-import org.tensorflow.lite.support.common.ops.NormalizeOp
 import org.tensorflow.lite.support.image.ImageProcessor
 import org.tensorflow.lite.support.image.TensorImage
 import org.tensorflow.lite.support.image.ops.ResizeOp
 import org.tensorflow.lite.support.image.ops.ResizeWithCropOrPadOp
 import org.tensorflow.lite.support.image.ops.Rot90Op
+import org.tensorflow.lite.support.tensorbuffer.TensorBuffer
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import kotlin.math.min
@@ -61,6 +61,8 @@ class CameraActivity : AppCompatActivity() {
 
     private lateinit var bitmapBuffer: Bitmap
 
+    private lateinit var labels: List<String>
+
     private val executor = Executors.newSingleThreadExecutor()
     private val permissions = listOf(Manifest.permission.CAMERA)
     private val permissionsRequestCode = Random.nextInt(0, 10000)
@@ -70,7 +72,7 @@ class CameraActivity : AppCompatActivity() {
 
     private var pauseAnalysis = false
     private var imageRotationDegrees: Int = 0
-    private val tfImageBuffer = TensorImage(DataType.UINT8)
+    private val tfImageBuffer = TensorImage(DataType.FLOAT32)
 
     private val tfImageProcessor by lazy {
         val cropSize = minOf(bitmapBuffer.width, bitmapBuffer.height)
@@ -79,7 +81,7 @@ class CameraActivity : AppCompatActivity() {
             .add(ResizeOp(
                 tfInputSize.height, tfInputSize.width, ResizeOp.ResizeMethod.NEAREST_NEIGHBOR))
             .add(Rot90Op(-imageRotationDegrees / 90))
-            .add(NormalizeOp(0f, 1f))
+       //     .add(NormalizeOp(0f, 1f))
             .build()
     }
 
@@ -107,6 +109,7 @@ class CameraActivity : AppCompatActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        labels = FileUtil.loadLabels(this, LABELS_PATH)
         activityCameraBinding = ActivityCameraBinding.inflate(layoutInflater)
         setContentView(activityCameraBinding.root)
 
@@ -201,11 +204,19 @@ class CameraActivity : AppCompatActivity() {
                 // Process the image in Tensorflow
                 val tfImage =  tfImageProcessor.process(tfImageBuffer.apply { load(bitmapBuffer) })
 
-                // Perform the object detection for the current frame
-                val predictions = detector.predict(tfImage)
+                val inputShape = tflite.getInputTensor(0).shape()
+                val inputDatatype = tflite.getInputTensor(0).dataType()
+                val outputShape = tflite.getOutputTensor(0).shape()
+                val outputDatatype = tflite.getOutputTensor(0).dataType()
+                val outputProbabilityBuffer = TensorBuffer.createFixedSize(outputShape, outputDatatype);
+
+
+                tflite.run(tfImage.buffer, outputProbabilityBuffer.buffer)
+
+                val predictions = outputProbabilityBuffer.floatArray
 
                 // Report only the top prediction
-                reportPrediction(predictions.maxByOrNull { it.score })
+                reportPrediction(predictions)
 
                 // Compute the FPS of the entire pipeline
                 val frameCount = 10
@@ -234,30 +245,38 @@ class CameraActivity : AppCompatActivity() {
     }
 
     private fun reportPrediction(
-        prediction: ObjectDetectionHelper.ObjectPrediction?
+        prediction: FloatArray
     ) = activityCameraBinding.viewFinder.post {
 
+        val arr = prediction.toTypedArray()
+
+        val indexed_max_prob = arr.withIndex().maxByOrNull { prob -> prob.value }
+
+        val max_val = indexed_max_prob?.value
+        val max_index = indexed_max_prob?.index
+        var max_label = max_index?.let { labels.get(it) }
+
         // Early exit: if prediction is not good enough, don't report it
-        if (prediction == null || prediction.score < ACCURACY_THRESHOLD) {
+        if (max_val == null || max_val < ACCURACY_THRESHOLD) {
             activityCameraBinding.boxPrediction.visibility = View.GONE
             activityCameraBinding.textPrediction.visibility = View.GONE
             return@post
         }
 
         // Location has to be mapped to our local coordinates
-        val location = mapOutputCoordinates(prediction.location)
+        //val location = mapOutputCoordinates(prediction)
 
         // Update the text and UI
-        activityCameraBinding.textPrediction.text = "${"%.2f".format(prediction.score)} ${prediction.label}"
-        (activityCameraBinding.boxPrediction.layoutParams as ViewGroup.MarginLayoutParams).apply {
-            topMargin = location.top.toInt()
-            leftMargin = location.left.toInt()
-            width = min(activityCameraBinding.viewFinder.width, location.right.toInt() - location.left.toInt())
-            height = min(activityCameraBinding.viewFinder.height, location.bottom.toInt() - location.top.toInt())
-        }
+        activityCameraBinding.textPrediction.text = "${"%.2f".format(max_val)} ${max_label}"
+        //(activityCameraBinding.boxPrediction.layoutParams as ViewGroup.MarginLayoutParams).apply {
+        //    topMargin = location.top.toInt()
+        //    leftMargin = location.left.toInt()
+        //    width = min(activityCameraBinding.viewFinder.width, location.right.toInt() - location.left.toInt())
+        //    height = min(activityCameraBinding.viewFinder.height, location.bottom.toInt() - location.top.toInt())
+        //}
 
         // Make sure all UI elements are visible
-        activityCameraBinding.boxPrediction.visibility = View.VISIBLE
+        //activityCameraBinding.boxPrediction.visibility = View.VISIBLE
         activityCameraBinding.textPrediction.visibility = View.VISIBLE
     }
 
@@ -342,8 +361,8 @@ class CameraActivity : AppCompatActivity() {
     companion object {
         private val TAG = CameraActivity::class.java.simpleName
 
-        private const val ACCURACY_THRESHOLD = 0.5f
-        private const val MODEL_PATH = "coco_ssd_mobilenet_v1_1.0_quant.tflite"
+        private const val ACCURACY_THRESHOLD = 0.2f
+        private const val MODEL_PATH = "mv3_concat_l2_50.tflite"
         private const val LABELS_PATH = "coco_ssd_mobilenet_v1_1.0_labels.txt"
     }
 }
